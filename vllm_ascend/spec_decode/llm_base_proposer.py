@@ -1185,8 +1185,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.sliding_window.apply(common_attn_metadata)
 
         lwd_inputs_embeds = self._lwd_build_first_pass_embeds(
-            num_tokens, num_input_tokens, next_token_ids,
-            token_indices_to_sample, common_attn_metadata,
+            num_tokens,
+            num_input_tokens,
+            next_token_ids,
+            token_indices_to_sample,
+            common_attn_metadata,
         )
         if lwd_inputs_embeds is not None:
             # LWD: organize the first-pass inputs from the
@@ -1832,10 +1835,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             import inspect
 
             try:
-                accepts = (
-                    "inputs_embeds"
-                    in inspect.signature(self.model.forward).parameters
-                )
+                accepts = "inputs_embeds" in inspect.signature(self.model.forward).parameters
             except (TypeError, ValueError):
                 accepts = False
             self._lwd_accepts_inputs_embeds = accepts
@@ -1858,21 +1858,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if computed is None:
             return None
         num_prompt = runner.input_batch.num_prompt_tokens
-        qsl = (cad.query_start_loc_cpu.tolist()
-               if getattr(cad, "query_start_loc_cpu", None) is not None
-               else cad.query_start_loc.tolist())
+        qsl = (
+            cad.query_start_loc_cpu.tolist()
+            if getattr(cad, "query_start_loc_cpu", None) is not None
+            else cad.query_start_loc.tolist()
+        )
         out = self.inputs_embeds  # persistent buffer (graph-safe)
         # Seed pass: after the right shift, input_ids are real tokens in
         # the decode segments and at the sampling position — embed the
         # whole batch once; the placeholder-zero prompt embeddings are
         # overwritten per-request below
-        out[:num_tokens] = self.model.embed_input_ids(
-            self.input_ids[:num_tokens]
-        )
+        out[:num_tokens] = self.model.embed_input_ids(self.input_ids[:num_tokens])
         wrote_any = False
         for i, req_id in enumerate(req_ids):
             s, e = int(qsl[i]), int(qsl[i + 1])
-            seg_len = e - s
             base = int(computed[i]) if i < len(computed) else 0
             prompt_len = int(num_prompt[i]) if i < len(num_prompt) else 0
             if base + 1 >= prompt_len:
