@@ -111,8 +111,40 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return target_argmax
 
 
+def _backup_token_id(req_state, idx: int) -> int:
+    """Placeholder-embeds tolerance for get_token_id.
+
+    LWD cloud requests have their prompt injected as
+    embeds; prompt_token_ids is None and reading an id at a prompt
+    position would raise (gpu_input_batch.py:get_token_id). The backup
+    value is only selected by torch.where when the request has no valid
+    sampled token this step: for a mid-prefill (chunked) request, that
+    position's draft input is overwritten by provider embeds (the prompt
+    overwrite in _lwd_build_first_pass_embeds), the id never reaches the
+    draft forward, so a zero placeholder suffices; decode/finished
+    requests always carry a valid sampled token and never consume the
+    backup.
+    """
+    if req_state.prompt_token_ids is None and idx < req_state.num_prompt_tokens:
+        return 0
+    return req_state.get_token_id(idx)
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
+
+    # LWD: provider of edge-computed prompt embeddings for the
+    # draft model's first pass (set by the worker at bring-up on the cloud).
+    # provider(req_id) -> Tensor [N, H] | None.
+    _lwd_prompt_embeds_provider = None
+
+    @classmethod
+    def set_lwd_prompt_embeds_provider(cls, provider) -> None:
+        # A bare function stored on the class binds self when read through an
+        # instance (descriptor protocol), adding a spurious argument at the
+        # call site; staticmethod keeps provider(req_id) as the raw callable.
+        cls._lwd_prompt_embeds_provider = staticmethod(provider)
+
     arange: torch.Tensor
     # GLM family: draft graph capture is not yet supported (see the forced-eager
     # gate in ``__init__``). Subclasses whose draft family supports graph input
@@ -176,39 +208,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # index during decode.
         return getattr(config, "image_token_index", None)
 
-def _backup_token_id(req_state, idx: int) -> int:
-    """Placeholder-embeds tolerance for get_token_id.
-
-    LWD cloud requests have their prompt injected as
-    embeds; prompt_token_ids is None and reading an id at a prompt
-    position would raise (gpu_input_batch.py:get_token_id). The backup
-    value is only selected by torch.where when the request has no valid
-    sampled token this step: for a mid-prefill (chunked) request, that
-    position's draft input is overwritten by provider embeds (the prompt
-    overwrite in _lwd_build_first_pass_embeds), the id never reaches the
-    draft forward, so a zero placeholder suffices; decode/finished
-    requests always carry a valid sampled token and never consume the
-    backup.
-    """
-    if req_state.prompt_token_ids is None and idx < req_state.num_prompt_tokens:
-        return 0
-    return req_state.get_token_id(idx)
-
-
-class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
-    _runnable: ACLGraphWrapper | Callable
-
-    # LWD: provider of edge-computed prompt embeddings for the
-    # draft model's first pass (set by the worker at bring-up on the cloud).
-    # provider(req_id) -> Tensor [N, H] | None.
-    _lwd_prompt_embeds_provider = None
-
-    @classmethod
-    def set_lwd_prompt_embeds_provider(cls, provider) -> None:
-        # A bare function stored on the class binds self when read through an
-        # instance (descriptor protocol), adding a spurious argument at the
-        # call site; staticmethod keeps provider(req_id) as the raw callable.
-        cls._lwd_prompt_embeds_provider = staticmethod(provider)
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
         self._ensure_query_start_loc_arange_capacity()
