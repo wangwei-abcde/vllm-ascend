@@ -22,6 +22,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
+from vllm_ascend.worker.lwd_edge_model.lwd_edge_loader import lwd_edge_loader_format
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
@@ -60,7 +61,11 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
     def load_model(self) -> None:
         """Load the edge model and read the CPU Hash routing tables for
         DeepSeek V4 from the weight files."""
-        super().load_model()
+        # LWD edge: the registered embed-only loader builds zero decoder
+        # layers and filters foreign layer weights from the stream; the
+        # stock load format is restored afterwards (cloud untouched).
+        with lwd_edge_loader_format(self.vllm_config.load_config):
+            super().load_model()
         # [layer-trace] Parity instrumentation (env-gated, zero overhead
         # when off): the edge install point; cloud and centralized share
         # the same code (see lwd_debug.lwd_layer_trace).
