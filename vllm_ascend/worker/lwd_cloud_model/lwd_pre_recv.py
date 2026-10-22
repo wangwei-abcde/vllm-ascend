@@ -53,16 +53,17 @@ endpoint rank only.
 from __future__ import annotations
 
 import base64
+import json
 import os
-import pickle
 import threading
 from collections.abc import Callable, Iterable
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 if TYPE_CHECKING:
-    from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+    from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 
 #: Env var carrying the downstream hint MQ handle. The executor exports it
 #: before creating the worker; the worker rebuilds the reader in
@@ -126,6 +127,29 @@ def _new_sideband_mq() -> MessageQueue:
     )
 
 
+def _encode_handle(handle: Handle) -> str:
+    """Encode a MessageQueue handle into an env-safe ASCII string.
+
+    Every Handle field is a JSON-native type, so the sideband handoff
+    never needs pickle (a forbidden import in this repo).
+    """
+    return base64.b64encode(json.dumps(asdict(handle)).encode("ascii")).decode("ascii")
+
+
+def _decode_handle(raw: str) -> Handle:
+    """Rebuild a Handle from its JSON encoding.
+
+    JSON arrays come back as lists; restore the tuple the MessageQueue
+    expects in buffer_handle.
+    """
+    fields = json.loads(base64.b64decode(raw))
+    if fields.get("buffer_handle") is not None:
+        fields["buffer_handle"] = tuple(fields["buffer_handle"])
+    from vllm.distributed.device_communicators.shm_broadcast import Handle
+
+    return Handle(**fields)
+
+
 def create_hint_mq() -> MessageQueue:
     """Engine side: create the hint MQ (writer) and export the handle to
     the environment.
@@ -134,7 +158,7 @@ def create_hint_mq() -> MessageQueue:
     from the env at startup); both fork and spawn inherit via env vars.
     """
     mq = _new_sideband_mq()
-    os.environ[LWD_RECV_HINT_MQ_ENV] = base64.b64encode(pickle.dumps(mq.export_handle())).decode("ascii")
+    os.environ[LWD_RECV_HINT_MQ_ENV] = _encode_handle(mq.export_handle())
     return mq
 
 
@@ -151,7 +175,7 @@ def attach_hint_mq() -> MessageQueue | None:
         return None
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
-    return MessageQueue.create_from_handle(pickle.loads(base64.b64decode(raw)), 0)
+    return MessageQueue.create_from_handle(_decode_handle(raw), 0)
 
 
 def create_report_mq() -> MessageQueue:
