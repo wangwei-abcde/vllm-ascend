@@ -22,8 +22,9 @@ hint queued there would never get its recv posted "early".
 
 * hint MQ: the engine creates the writer (handle exported to env before
   worker creation); the cloud endpoint rank attaches the reader by handle;
-* done MQ: the cloud endpoint rank creates the writer, the handle rides
-  the READY handshake back, and the engine attaches the reader.
+* done MQ: the cloud endpoint rank creates the writer; after the executor
+  is up, the engine fetches its handle over ``collective_rpc``
+  (``LwdCloudWorker.lwd_early_recv_done_handle``) and attaches the reader.
 
 Watermark semantics: ``is_irecv_complete(channel, seqno)`` ==
 ``seqno <= watermark``. Per-channel completion order = seqno order
@@ -58,21 +59,10 @@ import threading
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
-from vllm.lwd_logger import lwd_logger
-
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-
-# The logger name must sit inside the **vllm.** namespace: vLLM attaches
-# handlers only to loggers named "vllm" (DEFAULT_LOGGING_CONFIG,
-# propagate=False); child loggers reach that handler by propagation.
-# vllm_ascend.* loggers cannot reach "vllm" (the root logger has no
-# handler). This module's own logging keeps only exception diagnostics
-# (the healthy-path HINT/watermark/gate/worker segments are all logged in
-# lwd_cloud_engine.py / lwd_cloud_mixed_scheduler.py /
-# lwd_cloud_worker.py).
 
 #: Env var carrying the downstream hint MQ handle. The executor exports it
 #: before creating the worker; the worker rebuilds the reader in
@@ -124,18 +114,19 @@ def hint_fields(hint: dict) -> tuple[int, int, int] | None:
 # ---------------------------------------------------------------------- #
 # Bypass MQ lifecycle                                                    #
 # ---------------------------------------------------------------------- #
-def _new_sideband_mq() -> "MessageQueue":
+def _new_sideband_mq() -> MessageQueue:
     """A 1-reader 1-writer bypass MQ (hint and report share the spec; only the endpoint rank participates)."""
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
     return MessageQueue(
-        1, 1,
+        1,
+        1,
         max_chunk_bytes=_SIDEBAND_MAX_CHUNK_BYTES,
         max_chunks=_SIDEBAND_MAX_CHUNKS,
     )
 
 
-def create_hint_mq() -> "MessageQueue":
+def create_hint_mq() -> MessageQueue:
     """Engine side: create the hint MQ (writer) and export the handle to
     the environment.
 
@@ -143,13 +134,11 @@ def create_hint_mq() -> "MessageQueue":
     from the env at startup); both fork and spawn inherit via env vars.
     """
     mq = _new_sideband_mq()
-    os.environ[LWD_RECV_HINT_MQ_ENV] = base64.b64encode(
-        pickle.dumps(mq.export_handle())
-    ).decode("ascii")
+    os.environ[LWD_RECV_HINT_MQ_ENV] = base64.b64encode(pickle.dumps(mq.export_handle())).decode("ascii")
     return mq
 
 
-def attach_hint_mq() -> "MessageQueue | None":
+def attach_hint_mq() -> MessageQueue | None:
     """Worker side: rebuild the hint MQ reader from the handle in the
     environment.
 
@@ -165,8 +154,9 @@ def attach_hint_mq() -> "MessageQueue | None":
     return MessageQueue.create_from_handle(pickle.loads(base64.b64decode(raw)), 0)
 
 
-def create_report_mq() -> "MessageQueue":
-    """Worker side: create the done MQ (writer); the handle returns to the engine with the READY handshake."""
+def create_report_mq() -> MessageQueue:
+    """Worker side: create the done MQ (writer); the engine fetches its
+    handle over ``collective_rpc`` once the executor is up."""
     return _new_sideband_mq()
 
 
@@ -199,15 +189,11 @@ def post_irecv_hint(hint: dict) -> None:
     and they must be visible in the logs.
     """
     if _hint_sender is None:
-        # No transport = this process does not participate in early recv
-        # (e.g. the phase-scheduler escape hatch): losing a hint costs no
-        # correctness — that branch has no gate waiting on it, and the
-        # consume point posts the recv itself.
-        lwd_logger.warning(
-            "[Lwd][pre-recv] HINT DROPPED: no sender registered seqno=%s",
-            hint.get("seqno"),
-        )
-        return
+        # The engine registers the sender during startup, before it accepts
+        # any edge message, so a missing one is a wiring error; dropping the
+        # hint would stall the pre-recv gate forever (nobody would pre-post
+        # that recv, the watermark would never advance).
+        raise RuntimeError(f"[LWD] early-recv hint for seqno {hint.get('seqno')} has no registered sender")
     _hint_sender(hint)
 
 
