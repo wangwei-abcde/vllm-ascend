@@ -273,3 +273,4 @@ def test_v4_hash_wiring_on_main() -> None:
     assert "merge_hash_expert_ids(" in router_src
     assert 'getattr(_EXTRA_CTX, "lwd_hash_expert_ids", None)' in router_src
     assert "routing rows do not match router logits" in router_src
+
