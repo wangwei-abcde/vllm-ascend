@@ -948,29 +948,189 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             [(rid, base + n) for rid, n, base in arrivals],
         )
 
-    def _lwd_inject_from_stager(self, num_scheduled_tokens: np.ndarray) -> None:
-        """Per-request inject (A3): each request fetches exactly its native
-        scheduled rows [consumed, consumed+n) from its own host buffer -
-        fetch-as-much-as-scheduled, coordinate systems kept apart."""
+    # ------------------------------------------------------------------ #
+    # Shared window + TP broadcast (cpu_offload design v7 §4.5-4.6)       #
+    # ------------------------------------------------------------------ #
+
+    def _lwd_window_device(self, numel: int) -> tuple[torch.Tensor, int]:
+        """Shared window device buffer, double-buffered (v7 §4.5).
+
+        The endpoint reads from its host stager into this buffer; TP
+        broadcast replicates it to all ranks; the inject writes from it
+        into inputs_embeds. Per-row payload = hidden + optional expert-ID
+        tail (DSv4), so the broadcast carries both and non-endpoint ranks
+        get their expert IDs from the same frame.
+        """
+        bufs = getattr(self, "_lwd_win_dev", None)
+        if bufs is None or bufs[0].numel() < numel:
+            config = self.model_config.hf_config
+            from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
+                hash_layer_count,
+            )
+            per_row = int(getattr(self.worker, "_lwd_up_hidden_size", 0) or 0)
+            per_row += (
+                4 * hash_layer_count(config)
+                * int(getattr(config, "num_experts_per_tok", 0) or 0)
+            )
+            sched = getattr(self.vllm_config, "scheduler_config", None)
+            cap = max(numel, per_row * int(
+                getattr(sched, "max_num_batched_tokens", 0) or 0))
+            bufs = [
+                torch.empty(max(cap, numel), dtype=torch.bfloat16,
+                            device=self.device)
+                for _ in range(2)
+            ]
+            self._lwd_win_dev = bufs
+            self._lwd_win_flip = 0
+            self._lwd_win_used_ev: list = [None, None]
+            lwd_logger.info(
+                "[LWD][host-stage] win_dev rows_capacity=%d (%.1fMiB) x2",
+                bufs[0].numel() // max(self.model_config.get_hidden_size(), 1),
+                bufs[0].numel() * 2 / 2**20,
+            )
+        idx = self._lwd_win_flip
+        self._lwd_win_flip ^= 1
+        return bufs[idx][:numel], idx
+
+    def _lwd_harvest_and_broadcast(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> tuple[torch.Tensor | None, int | None]:
+        """Endpoint: host stager -> shared window -> TP broadcast (v7 §5.1).
+
+        Returns (dev_buffer, win_idx); (None, None) when nothing to inject
+        this step. All ranks call this; only the endpoint reads from the
+        stager, the rest just participate in the broadcast.
+        """
         worker = self.worker
-        stager = worker._lwd_stager
+        if worker is None:
+            return None, None
+        stager = getattr(worker, "_lwd_stager", None)
+        if stager is None:
+            return None, None
+
+        # Collect this step's prefill injection plan (arrival-driven):
+        # (rid, n_rows) for each request that has computed < prompt and
+        # n_scheduled > 0 — decode rows go through the token-ids path.
+        num_prompt = self.input_batch.num_prompt_tokens
+        computed = self.input_batch.num_computed_tokens_cpu
+        plan: list[tuple[str, int]] = []
+        for idx, rid in enumerate(self.input_batch.req_ids):
+            if idx >= len(num_scheduled_tokens):
+                break
+            w = int(num_scheduled_tokens[idx])
+            ncomp = int(computed[idx])
+            nprog = int(num_prompt[idx])
+            if ncomp >= nprog or w <= 0:
+                continue
+            w = min(w, nprog - ncomp)
+            if w > 0:
+                plan.append((rid, w))
+        if not plan:
+            return None, None
+
+        hidden_size = self.model_config.get_hidden_size()
+        from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
+            hash_layer_count,
+        )
+        config = self.model_config.hf_config
+        num_hash_layers = hash_layer_count(config)
+        per_row_tail = (
+            4 * num_hash_layers
+            * int(getattr(config, "num_experts_per_tok", 0) or 0)
+        )
+        total_rows = sum(w for _r, w in plan)
+        embed_numel = total_rows * hidden_size
+        is_endpoint = bool(getattr(worker, "_lwd_early_recv_endpoint", False))
+
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+        tp = get_tp_group()
+
+        if is_endpoint:
+            dev, win_idx = self._lwd_window_device(
+                embed_numel + total_rows * per_row_tail)
+            offset = 0
+            tail_offset = 0
+            for rid, w in plan:
+                # Identity check (cpu_offload hard invariant): the stager's
+                # read pointer must equal the scheduler's num_computed —
+                # any mismatch means the embeddings would be injected at a
+                # position that does not match the data read.
+                idx_in_batch = self.input_batch.req_id_to_index.get(rid)
+                expect = int(computed[idx_in_batch]) if idx_in_batch is not None and idx_in_batch < len(computed) else 0
+                if stager.consumed_rows(rid) != expect:
+                    raise RuntimeError(
+                        f"[LWD] STAGE POSITION MISMATCH req={rid}: "
+                        f"consumed={stager.consumed_rows(rid)} != "
+                        f"computed={expect} (rows={w})")
+                host_start, numel, _tail = stager.segment_for(rid, w)
+                req = stager.take_req(rid)
+                dev[offset : offset + numel].copy_(
+                    req.host[host_start : host_start + numel],
+                    non_blocking=True,
+                )
+                offset += numel
+                if per_row_tail:
+                    t_start, _t_end = req.tail_range_at(expect, w)
+                    n = w * per_row_tail
+                    dev[embed_numel + tail_offset :
+                        embed_numel + tail_offset + n].copy_(
+                        req.host[t_start : t_start + n], non_blocking=True)
+                    tail_offset += n
+                stager.consume(rid, w)
+            lwd_logger.info(
+                "[LWD][cloud-runner] HARVEST rows=%d reqs=%d "
+                "tail=%d win_idx=%d",
+                total_rows, len(plan), per_row_tail > 0, win_idx,
+            )
+        else:
+            # Non-endpoint: same buffer size, filled by broadcast below
+            dev, win_idx = self._lwd_window_device(
+                embed_numel + total_rows * per_row_tail)
+
+        if tp.world_size > 1 and dev.numel() > 0:
+            work = dist.broadcast(
+                dev, src=tp.ranks[0], group=tp.device_group, async_op=True)
+            work.wait()  # bridge broadcast to compute stream for ordered copy
+        return dev, win_idx
+
+    def _lwd_inject_from_stager(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> None:
+        """Per-request inject: broadcast buffer -> inputs_embeds (v7 §5.1).
+
+        Two-phase: _lwd_harvest_and_broadcast fills the shared window and
+        TP-broadcasts it; this method writes from the broadcast buffer
+        into each request's scheduling window in inputs_embeds.gpu.
+        Works identically on endpoint and non-endpoint ranks (both hold
+        the broadcast result).
+        """
+        dev, _win_idx = self._lwd_harvest_and_broadcast(num_scheduled_tokens)
+        if dev is None:
+            return
         hidden_size = self.model_config.get_hidden_size()
         gpu_embeds = self.inputs_embeds.gpu
-        flat = 0
+        # Flattened output offset per request (same accumulation as the
+        # native fill loop): each request's scheduling-segment start.
+        offsets: dict[str, int] = {}
+        off = 0
         for i, rid in enumerate(self.input_batch.req_ids):
-            n = int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
-            emb = stager.take_req(rid)
-            if emb is None or n <= 0:
-                flat += n
-                continue
-            start, numel_seg, _tail = stager.segment_for(rid, n)
-            seg = emb.host[start : start + numel_seg].view(n, hidden_size)
-            gpu_embeds[flat : flat + n].copy_(
-                seg.to(device=gpu_embeds.device, non_blocking=True),
-                non_blocking=True,
-            )
-            stager.consume(rid, n)
-            flat += n
+            offsets[rid] = off
+            off += int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
+        num_prompt = self.input_batch.num_prompt_tokens
+        computed = self.input_batch.num_computed_tokens_cpu
+        elem_offset = 0
+        for i, rid in enumerate(self.input_batch.req_ids):
+            w = int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
+            ncomp = int(computed[i])
+            nprog = int(num_prompt[i])
+            if ncomp >= nprog or w <= 0:
+                continue  # decode row or nothing scheduled — token-ids path
+            w = min(w, nprog - ncomp)
+            numel = w * hidden_size
+            gpu_embeds[offsets[rid] : offsets[rid] + w].copy_(
+                dev[elem_offset : elem_offset + numel].view(w, hidden_size))
+            elem_offset += numel
 
     def _lwd_inject_remote_embeds(
         self,
