@@ -87,25 +87,24 @@ def make_recv_hint(
     seqno: int,
     num_tokens: int,
     aux_rows: int = 0,
-    req_rows: list | None = None,
-    prompt_lens: list | None = None,
+    req_ids: list[str] | None = None,
+    rows: list[int] | None = None,
+    prompt_offsets: list[int] | None = None,
+    prompt_lens: list[int] | None = None,
 ) -> dict:
-    """Build one UP early-recv hint.
+    """Build one UP early-recv hint (cpu_offload two-coordinate contract).
 
-    * ``num_tokens``: the batch's flat token count (the main-frame size
-      is derived worker-side from the hash payload formula)
-    * ``aux_rows``: the batch's mrope-carrying token rows (0 = text-only
-      batch, zero aux traffic)
+    Two coordinate systems, do NOT merge:
+    * ``rows``           = per-request row count IN THIS BATCH
+    * ``prompt_offsets`` = per-request start WITHIN ITS OWN PROMPT
+    * ``prompt_lens``    = per-request full prompt length (stager sizing)
     """
     return {
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
-        # Absolute per-request arrival rows in PROMPT coordinates
-        # (offset + rows of the range item): the worker piggybacks them on
-        # the done report, the engine's hold ledger releases on them.
-        "req_rows": [(str(r), int(n)) for r, n in (req_rows or [])],
-        # Per-request prompt total length (stager pool sizing authority;
-        # the comm-thread D2H uses it to size host buffers at full length).
+        "req_ids": [str(r) for r in (req_ids or [])],
+        "rows": [int(n) for n in (rows or [])],
+        "prompt_offsets": [int(n) for n in (prompt_offsets or [])],
         "prompt_lens": [int(n) for n in (prompt_lens or [])],
         "num_tokens": int(num_tokens),
         "aux_rows": int(aux_rows),

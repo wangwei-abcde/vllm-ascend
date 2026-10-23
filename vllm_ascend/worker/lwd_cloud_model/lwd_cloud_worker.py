@@ -491,15 +491,18 @@ class LwdCloudWorker(LwdWorkerBase):
         key = (hint["channel"], seqno)
         # A2: absolute per-request arrival rows ride the hint; remembered per
         # key so the done report can piggyback them (engine hold release).
-        self._early_recv_req_rows[key] = list(hint.get("req_rows") or ())
+        self._early_recv_req_rows[key] = {
+            "req_ids": list(hint.get("req_ids") or ()),
+            "rows": list(hint.get("rows") or ()),
+            "prompt_offsets": list(hint.get("prompt_offsets") or ()),
+            "prompt_lens": list(hint.get("prompt_lens") or ()),
+        }
         # D2H needs per-request prompt total length (stager pool sizing)
         if not hasattr(self, "_lwd_prompt_lens"):
             self._lwd_prompt_lens: dict[str, int] = {}
-        for rid, _rows in (hint.get("req_rows") or ()):
-            self._lwd_prompt_lens.setdefault(rid, 0)
-        pl = hint.get("prompt_lens") or []
-        for (rid, _r), p_len in zip(hint.get("req_rows") or (), pl):
-            self._lwd_prompt_lens[rid] = p_len
+        for rid, p_len in zip(hint.get("req_ids") or (),
+                              hint.get("prompt_lens") or ()):
+            self._lwd_prompt_lens[rid] = int(p_len)
         with self._early_recv_lock:
             if key in self._early_recv_futures or key in self._early_recv_consumed or key in self._early_recv_pending:
                 return
@@ -580,9 +583,14 @@ class LwdCloudWorker(LwdWorkerBase):
             up_flat = res.tensor
             if up_flat is None:
                 return
-            # Plan per-request segments from the hint's geometry
-            hint = self._early_recv_req_rows.get(key) or []
-            if not hint:
+            # Plan per-request segments (cpu_offload two-coordinate contract)
+            geo = self._early_recv_req_rows.get(key) or {}
+            hint_req_ids = list(geo.get("req_ids") or ())
+            hint_rows = [int(n) for n in (geo.get("rows") or [])]
+            hint_prompt_offsets = [int(n) for n in (geo.get("prompt_offsets") or [])]
+            hint_prompt_lens = [int(n) for n in (geo.get("prompt_lens") or [])]
+            if not hint_req_ids or not hint_rows:
+                lwd_logger.warning("[LWD] D2H skipped: no geometry key=%s", key)
                 return
             hidden = self._lwd_up_hidden_size
             from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
@@ -591,32 +599,22 @@ class LwdCloudWorker(LwdWorkerBase):
             cfg = self.model_config.hf_config
             nl = hash_layer_count(cfg)
             tk = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
-            req_rows = [(rid, rows) for rid, rows in hint]
-            # num_tokens_per_req from the hint rows
-            num_tokens_per_req = [rows for _rid, rows in req_rows]
-            prompt_lens = []
-            for rid, _rows in req_rows:
-                prompt_lens.append(
-                    getattr(self, "_lwd_prompt_lens", {}).get(rid, 0) or rows)
             segments = stager.plan_recv_segments(
-                seqno=seqno,
-                numel=up_flat.numel(),
-                hidden_size=hidden,
-                req_ids=[rid for rid, _r in req_rows],
-                num_tokens_per_req=num_tokens_per_req,
-                prompt_lens=prompt_lens,
-                num_hash_layers=nl,
-                num_experts_per_tok=tk,
+                seqno=seqno, numel=up_flat.numel(), hidden_size=hidden,
+                req_ids=hint_req_ids, num_tokens_per_req=hint_rows,
+                prompt_lens=hint_prompt_lens, row_base=hint_prompt_offsets,
+                num_hash_layers=nl, num_experts_per_tok=tk,
             )
             for dst_view, src_off, n in segments:
                 dst_view.copy_(up_flat[src_off:src_off + n].cpu(),
                                non_blocking=False)
             arrivals = stager.publish_received(seqno)
-            rows = [(rid, base + n) for rid, n, base in arrivals]
-            done_mq.enqueue((key[0], seqno, rows))
+            rows_report = [(rid, emb.recv_rows if (emb := stager.take_req(rid)) else off + n)
+                           for rid, n, off in zip(hint_req_ids, hint_rows, hint_prompt_offsets)]
+            done_mq.enqueue((key[0], seqno, rows_report))
             lwd_logger.info(
                 "[LWD] staged to host seqno=%d reqs=%d rows=%s (comm thread)",
-                seqno, len(req_rows), rows)
+                seqno, len(hint_req_ids), rows_report)
         except Exception:
             lwd_logger.exception(
                 "[LWD] comm-thread D2H failed key=%s (arrival stalls)", key)
